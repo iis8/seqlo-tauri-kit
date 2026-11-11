@@ -23,6 +23,10 @@ pnpm-debug.log*
 # vite 临时产物
 vite.config.js.timestamp-*.mjs
 
+# ---------- WorkBuddy 本地数据 ----------
+# 项目相关本地数据，不纳入版本管理（非临时缓存，勿删）
+.workbuddy-ai/
+
 # ---------- 日志与临时文件 ----------
 *.log
 logs/

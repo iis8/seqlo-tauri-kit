@@ -14,10 +14,14 @@ tauri = { version = "2", features = ["tray-icon", "image-png"] }
 tauri-plugin-notification = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order"] }
-# 迁移器仅依赖 rusqlite（与宿主同源，不会重复链接 SQLite）。
-rusqlite = { version = "0.32", features = ["bundled"] }
+# 迁移器（及未来的 KV 持久化）统一走 sqlx：异步、单一 SQLite 驱动，与宿主 core 同源。
+sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio", "tls-rustls"] }
 chrono = "0.4"
 once_cell = "1"
 # splash macOS alpha 握手（公开 API，与桌面端同版本）。
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2 = "0.6"
+
+[dev-dependencies]
+# 异步单测（迁移器入口为 async）。
+tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

@@ -3,7 +3,7 @@
 //! 提供与业务无关的通用能力，供 `video-crawl-desktop` 及其它 Tauri 2 项目复用：
 //!
 //! - [`config`]：通用 KV 配置抽象（`ConfigSection` / `ConfigStore` / `KvStore`）。
-//! - [`migration`]：SQLite 版本化迁移器（简版 Flyway，零业务耦合）。
+//! - [`migration`]：SQLite 版本化迁移器（简版 Flyway，基于 sqlx，零业务耦合）。
 //! - [`splash`]：启动页（splash）状态机、macOS alpha 握手、原生主题同步。
 //! - [`window`]：系统托盘与关窗行为决策矩阵。
 //! - [`notify`]：系统通知 / 应用内浮层引擎（路由、勿扰、节流、待弹队列、点击跳转）。

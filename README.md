@@ -1,7 +1,7 @@
-# vc-desktop-kit
+# seqlo-tauri-kit
 
-Tauri 2 桌面端通用基础框架。提供与业务无关的五大能力，供 `video-crawl-desktop`
-及任意其它 Tauri 2 项目复用：
+Tauri 2 桌面端通用基础框架（Rust crate 名：`vc-desktop-kit`）。提供与业务无关的
+五大能力，供 `video-crawl-desktop` 及任意其它 Tauri 2 项目复用：
 
 | 模块 | 能力 |
 |---|---|
@@ -10,6 +10,10 @@ Tauri 2 桌面端通用基础框架。提供与业务无关的五大能力，供
 | [`splash`] | 启动页双窗口汇合状态机、macOS alpha 握手、原生主题同步 |
 | [`window`] | 系统托盘、关窗行为决策矩阵、托盘/关窗配置读写 |
 | [`notify`] | 系统通知/应用内浮层引擎：路由、勿扰、节流、待弹队列、点击跳转 |
+
+配套前端包 [`web/`](./web/README.md)（`@seqlo/tauri-notify`）：应用内通知浮层的
+纯状态机 + Vue 组件，与 [`notify`] 模块前后端配套（Rust 决定发不发系统通知，
+前端只排前台浮层）。`cargo` 打包已 `exclude = ["web"]`。
 
 ## 设计边界（重要）
 

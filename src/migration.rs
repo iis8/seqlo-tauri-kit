@@ -1,4 +1,4 @@
-//! SQLite 版本化迁移（简版 Flyway，仅支持前向迁移）。
+//! SQLite 版本化迁移（简版 Flyway，仅支持前向迁移，基于 sqlx + SQLite，异步）。
 //!
 //! 机制：
 //! - 脚本由宿主以 [`Migration`] 列表提供（通常 `include_str!` 编译期内嵌进二进制，
@@ -9,12 +9,22 @@
 //! - 已应用脚本内容不可变：checksum 不匹配（或库里出现当前程序不包含的版本）即拒绝启动，
 //!   防止「改老脚本」与「程序降级」两类事故。
 //!
-//! 宿主新增一次迁移：在 [`run`] 调用处登记一行 `Migration { version, name, sql, already_applied }`
-//! 即可；`validate_registry` 会在启动时静态校验版本号递增与命名合法性。
+//! 注意：本模块全部入口都是 `async`，需在一个 tokio runtime 内调用
+//! （Tauri 2 的 setup / 后台线程天然满足）。宿主侧统一使用 sqlx 的 [`SqlitePool`]，
+//! 与业务库（global.db / project.db）同源、单一 SQLite 驱动。
+//!
+//! 宿主新增一次迁移：在 [`run`] / [`run_with`] 调用处登记一行
+//! `Migration { version, name, sql, already_applied }` 即可；
+//! `validate_registry` 会在启动时静态校验版本号递增与命名合法性。
 
-use rusqlite::{params, Connection};
 use std::collections::HashMap;
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Instant;
+
+use sqlx::sqlite::SqlitePool;
+use sqlx::Row;
 
 /// 默认存量基线版本：任何经过宿主 `init_schema()` 后都收敛到的形态。
 /// 历史结构（v1..v3）无法准确考古回放，故首次见到本迁移器时直接写入
@@ -35,7 +45,13 @@ CREATE TABLE IF NOT EXISTS schema_history (
 );
 "#;
 
-/// 一条可执行的版本化迁移。`sql` 通常由 `include_str!` 编译期内嵌。
+/// 迁移探针：版本尚未登记时，宿主用它确认「结构变更已被更早的非版本化引导代码完成」，
+/// 此时按当前 checksum 补登记为已应用、不执行脚本。因需查询数据库，故为异步。
+pub type MigrationProbe = Arc<
+    dyn for<'a> Fn(&'a SqlitePool) -> Pin<Box<dyn Future<Output = bool> + Send + 'a>> + Send + Sync,
+>;
+
+/// 一条可执行的版本化迁移。`sql` 通常由 `include_str!` 编译期内嵌（可含多条语句，按 `;` 拆分顺序执行）。
 pub struct Migration {
     pub version: i64,
     pub name: &'static str,
@@ -44,7 +60,7 @@ pub struct Migration {
     /// 某些库在迁移机制正式建立前，已被引导代码改成该版本的后置形态（没有历史记录）。
     /// 版本尚未登记且探针返回 true 时，按当前 checksum 直接补登记为已应用、不执行脚本，
     /// 避免对这类库重跑 DDL 而失败（如重复加列）。
-    pub already_applied: Option<fn(&Connection) -> bool>,
+    pub already_applied: Option<MigrationProbe>,
 }
 
 impl Migration {
@@ -64,40 +80,38 @@ impl Migration {
     }
 }
 
-/// 启动入口（默认基线 = [`DEFAULT_BASELINE`]）：建版本表、写基线、按序应用缺失脚本。
-///
-/// 需要 `&mut`：rusqlite 的事务 API 要求可变借用；启动迁移发生在拿到独占锁之后，
-/// 不存在并发访问。
-pub fn run(c: &mut Connection, migrations: &[Migration]) -> Result<(), String> {
-    run_with(c, migrations, DEFAULT_BASELINE)
+/// 启动入口（默认基线 = [`DEFAULT_BASELINE】）：建版本表、写基线、按序应用缺失脚本。
+pub async fn run(pool: &SqlitePool, migrations: &[Migration]) -> Result<(), String> {
+    run_with(pool, migrations, DEFAULT_BASELINE).await
 }
 
 /// 启动入口（自定义基线版本）：与 [`run`] 相同，但允许宿主指定存量基线版本号。
-pub fn run_with(
-    c: &mut Connection,
+pub async fn run_with(
+    pool: &SqlitePool,
     migrations: &[Migration],
     baseline: i64,
 ) -> Result<(), String> {
-    c.execute_batch(HISTORY_DDL)
-        .map_err(|e| format!("创建 schema_history 表失败: {}", e))?;
-    ensure_baseline(c, baseline)?;
+    sqlx::query(HISTORY_DDL)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("创建 schema_history 表失败: {e}"))?;
+    ensure_baseline(pool, baseline).await?;
     validate_registry(migrations, baseline)?;
-    reconcile_preapplied(c, migrations)?;
+    reconcile_preapplied(pool, migrations).await?;
 
     // 已成功应用的 SQL 迁移：version -> checksum
     let applied: HashMap<i64, String> = {
-        let mut stmt = c
-            .prepare(
-                "SELECT version, checksum FROM schema_history \
-                 WHERE type = 'SQL' AND success = 1",
-            )
-            .map_err(|e| e.to_string())?;
-        let rows = stmt
-            .query_map([], |r| Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?)))
-            .map_err(|e| e.to_string())?;
+        let rows = sqlx::query(
+            "SELECT version, checksum FROM schema_history \
+             WHERE type = 'SQL' AND success = 1",
+        )
+        .fetch_all(pool)
+        .await
+        .map_err(|e| e.to_string())?;
         let mut map = HashMap::new();
         for row in rows {
-            let (v, cs) = row.map_err(|e| e.to_string())?;
+            let v: i64 = row.try_get(0).map_err(|e| e.to_string())?;
+            let cs: String = row.try_get(1).map_err(|e| e.to_string())?;
             map.insert(v, cs);
         }
         map
@@ -123,40 +137,42 @@ pub fn run_with(
             }
             continue;
         }
-        apply_one(c, m)?;
+        apply_one(pool, m).await?;
     }
     Ok(())
 }
 
 /// 带外缝合：版本未登记但探针确认其结构变更已被更早的非版本化引导代码完成时，
 /// 按当前 checksum 补一条成功记录，使后续正常流程跳过该脚本。仅做只读探测 + 插历史行。
-fn reconcile_preapplied(c: &mut Connection, migrations: &[Migration]) -> Result<(), String> {
+async fn reconcile_preapplied(pool: &SqlitePool, migrations: &[Migration]) -> Result<(), String> {
     for m in migrations {
-        let Some(probe) = m.already_applied else {
+        let Some(probe) = &m.already_applied else {
             continue;
         };
-        let done: i64 = c
-            .query_row(
-                "SELECT COUNT(*) FROM schema_history WHERE type='SQL' AND version=? AND success=1",
-                params![m.version],
-                |r| r.get(0),
-            )
-            .map_err(|e| e.to_string())?;
-        if done > 0 || !probe(c) {
+        let done: i64 = sqlx::query(
+            "SELECT COUNT(*) FROM schema_history WHERE type='SQL' AND version=? AND success=1",
+        )
+        .bind(m.version)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .try_get(0)
+        .map_err(|e| e.to_string())?;
+        if done > 0 || !probe(pool).await {
             continue;
         }
-        c.execute(
+        sqlx::query(
             "INSERT INTO schema_history \
                (type, version, description, script, checksum, installed_on, execution_ms, success) \
              VALUES ('SQL', ?, ?, ?, ?, ?, 0, 1)",
-            params![
-                m.version,
-                m.name,
-                m.script_name(),
-                m.checksum(),
-                now_str()
-            ],
         )
+        .bind(m.version)
+        .bind(m.name)
+        .bind(m.script_name())
+        .bind(m.checksum())
+        .bind(now_str())
+        .execute(pool)
+        .await
         .map_err(|e| format!("补登记迁移 V{} 失败: {}", m.version, e))?;
         eprintln!(
             "[migration] 检测到 V{} 的结构变更已就位，补登记为已应用（不执行脚本）",
@@ -167,20 +183,26 @@ fn reconcile_preapplied(c: &mut Connection, migrations: &[Migration]) -> Result<
 }
 
 /// 版本表为空时写入 BASELINE（存量库与全新库都由 init_schema 收敛到该形态）。
-fn ensure_baseline(c: &mut Connection, baseline: i64) -> Result<(), String> {
-    let count: i64 = c
-        .query_row("SELECT COUNT(*) FROM schema_history", [], |r| r.get(0))
+async fn ensure_baseline(pool: &SqlitePool, baseline: i64) -> Result<(), String> {
+    let count: i64 = sqlx::query("SELECT COUNT(*) FROM schema_history")
+        .fetch_one(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .try_get(0)
         .map_err(|e| e.to_string())?;
     if count > 0 {
         return Ok(());
     }
-    c.execute(
+    sqlx::query(
         "INSERT INTO schema_history \
            (type, version, description, script, checksum, installed_on, execution_ms, success) \
          VALUES ('BASELINE', ?, 'baseline', 'BASELINE', '', ?, 0, 1)",
-        params![baseline, now_str()],
     )
-    .map_err(|e| format!("写入基线版本记录失败: {}", e))?;
+    .bind(baseline)
+    .bind(now_str())
+    .execute(pool)
+    .await
+    .map_err(|e| format!("写入基线版本记录失败: {e}"))?;
     eprintln!("[migration] 版本表初始化，写入基线 V{}", baseline);
     Ok(())
 }
@@ -222,40 +244,81 @@ pub fn validate_registry(migrations: &[Migration], baseline: i64) -> Result<(), 
     Ok(())
 }
 
-/// 执行单个迁移：整个脚本包在一个事务里，任一步失败即回滚（含已执行的 DDL）。
-fn apply_one(c: &mut Connection, m: &Migration) -> Result<(), String> {
+/// 执行单个迁移：整个脚本包在一个事务里（按 `;` 拆成多条语句顺序执行），任一步失败即回滚（含已执行的 DDL）。
+async fn apply_one(pool: &SqlitePool, m: &Migration) -> Result<(), String> {
     let name = m.script_name();
     let started = Instant::now();
     eprintln!("[migration] 开始执行 {} ...", name);
 
-    let outcome: Result<(), String> = (|| {
-        let tx = c.transaction().map_err(|e| e.to_string())?;
-        tx.execute_batch(m.sql).map_err(|e| e.to_string())?;
-        tx.execute(
+    let outcome: Result<(), String> = async {
+        let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
+        for stmt in split_statements(m.sql) {
+            sqlx::query(stmt)
+                .execute(&mut *tx)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+        sqlx::query(
             "INSERT INTO schema_history \
                (type, version, description, script, checksum, installed_on, execution_ms, success) \
              VALUES ('SQL', ?, ?, ?, ?, ?, ?, 1)",
-            params![
-                m.version,
-                m.name,
-                name,
-                m.checksum(),
-                now_str(),
-                started.elapsed().as_millis() as i64
-            ],
         )
+        .bind(m.version)
+        .bind(m.name)
+        .bind(name.clone())
+        .bind(m.checksum())
+        .bind(now_str())
+        .bind(started.elapsed().as_millis() as i64)
+        .execute(&mut *tx)
+        .await
         .map_err(|e| e.to_string())?;
-        tx.commit().map_err(|e| e.to_string())?;
+        tx.commit().await.map_err(|e| e.to_string())?;
         Ok(())
-    })();
+    }
+    .await;
 
     match outcome {
         Ok(()) => {
-            eprintln!("[migration] {} 完成（{}ms）", name, started.elapsed().as_millis());
+            eprintln!(
+                "[migration] {} 完成（{}ms）",
+                name,
+                started.elapsed().as_millis()
+            );
             Ok(())
         }
         Err(e) => Err(format!("迁移 {} 失败，已回滚: {}", name, e)),
     }
+}
+
+/// 把迁移脚本按顶层 `;` 拆成单条语句，忽略字符串字面量（`'...'` / `"..."`）内的分号。
+/// 注释内的分号不特殊处理（迁移脚本通常为纯 DDL，风险可控）。
+fn split_statements(sql: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut in_single = false;
+    let mut in_double = false;
+    let bytes = sql.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i] as char;
+        if c == '\'' && !in_double {
+            in_single = !in_single;
+        } else if c == '"' && !in_single {
+            in_double = !in_double;
+        } else if c == ';' && !in_single && !in_double {
+            let stmt = sql[start..i].trim();
+            if !stmt.is_empty() {
+                out.push(stmt);
+            }
+            start = i + 1;
+        }
+        i += 1;
+    }
+    let tail = sql[start..].trim();
+    if !tail.is_empty() {
+        out.push(tail);
+    }
+    out
 }
 
 fn now_str() -> String {
@@ -265,6 +328,7 @@ fn now_str() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sqlx::sqlite::{SqlitePool, SqlitePoolOptions};
 
     fn mg(version: i64, name: &'static str, sql: &'static str) -> Migration {
         Migration {
@@ -279,53 +343,64 @@ mod tests {
         version: i64,
         name: &'static str,
         sql: &'static str,
-        probe: fn(&Connection) -> bool,
+        probe: fn() -> bool,
     ) -> Migration {
         Migration {
             version,
             name,
             sql,
-            already_applied: Some(probe),
+            already_applied: Some(Arc::new(
+                move |_pool: &SqlitePool| -> Pin<Box<dyn Future<Output = bool> + Send + '_>> {
+                    Box::pin(async move { (probe)() })
+                },
+            )),
         }
     }
 
-    fn history_versions(c: &Connection) -> Vec<(String, i64)> {
-        let mut stmt = c
-            .prepare("SELECT type, version FROM schema_history ORDER BY installed_rank")
+    async fn open_mem() -> SqlitePool {
+        SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory pool")
+    }
+
+    async fn history_versions(pool: &SqlitePool) -> Vec<(String, i64)> {
+        let rows = sqlx::query("SELECT type, version FROM schema_history ORDER BY installed_rank")
+            .fetch_all(pool)
+            .await
             .unwrap();
-        stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)?)))
-            .unwrap()
-            .flatten()
+        rows.into_iter()
+            .map(|r| (r.get::<String, _>(0), r.get::<i64, _>(1)))
             .collect()
     }
 
-    fn table_exists(c: &Connection, name: &str) -> bool {
-        let n: i64 = c
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?",
-                params![name],
-                |r| r.get(0),
-            )
-            .unwrap();
+    async fn table_exists(pool: &SqlitePool, name: &str) -> bool {
+        let n: i64 = sqlx::query("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name=?")
+            .bind(name)
+            .fetch_one(pool)
+            .await
+            .unwrap()
+            .get::<i64, _>(0);
         n > 0
     }
 
-    #[test]
-    fn fresh_db_writes_baseline_and_is_idempotent() {
-        let mut c = Connection::open_in_memory().unwrap();
-        run_with(&mut c, &[], DEFAULT_BASELINE).unwrap();
+    #[tokio::test]
+    async fn fresh_db_writes_baseline_and_is_idempotent() {
+        let pool = open_mem().await;
+        run_with(&pool, &[], DEFAULT_BASELINE).await.unwrap();
         assert_eq!(
-            history_versions(&c),
+            history_versions(&pool).await,
             vec![("BASELINE".to_string(), DEFAULT_BASELINE)]
         );
         // 再跑一次不重复写基线
-        run_with(&mut c, &[], DEFAULT_BASELINE).unwrap();
-        assert_eq!(history_versions(&c).len(), 1);
+        run_with(&pool, &[], DEFAULT_BASELINE).await.unwrap();
+        assert_eq!(history_versions(&pool).await.len(), 1);
     }
 
-    #[test]
-    fn applies_pending_migrations_in_order_and_skips_applied() {
-        let mut c = Connection::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn applies_pending_migrations_in_order_and_skips_applied() {
+        let pool = open_mem().await;
         let v4 = mg(
             4,
             "create_probe",
@@ -336,12 +411,16 @@ mod tests {
             "add_probe_name",
             "ALTER TABLE probe ADD COLUMN name TEXT NOT NULL DEFAULT '';",
         );
-        run_with(&mut c, &[v4, v5], DEFAULT_BASELINE).unwrap();
-        assert!(table_exists(&c, "probe"));
-        let val: i64 = c.query_row("SELECT id FROM probe", [], |r| r.get(0)).unwrap();
+        run_with(&pool, &[v4, v5], DEFAULT_BASELINE).await.unwrap();
+        assert!(table_exists(&pool, "probe").await);
+        let val: i64 = sqlx::query("SELECT id FROM probe")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .get::<i64, _>(0);
         assert_eq!(val, 42);
         assert_eq!(
-            history_versions(&c),
+            history_versions(&pool).await,
             vec![
                 ("BASELINE".to_string(), DEFAULT_BASELINE),
                 ("SQL".to_string(), 4),
@@ -359,24 +438,27 @@ mod tests {
             "add_probe_name",
             "ALTER TABLE probe ADD COLUMN name TEXT NOT NULL DEFAULT '';",
         );
-        run_with(&mut c, &[v4, v5], DEFAULT_BASELINE).unwrap();
-        assert_eq!(history_versions(&c).len(), 3);
+        run_with(&pool, &[v4, v5], DEFAULT_BASELINE).await.unwrap();
+        assert_eq!(history_versions(&pool).await.len(), 3);
     }
 
-    #[test]
-    fn preapplied_probe_backfills_history_without_running_script() {
-        let mut c = Connection::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn preapplied_probe_backfills_history_without_running_script() {
+        let pool = open_mem().await;
         // 探针确认为后置形态：只补登记，不执行脚本（建表不应发生）
         let v4 = mg_probed(
             4,
             "already_done",
             "CREATE TABLE should_not_exist (x INTEGER);",
-            |_| true,
+            || true,
         );
-        run_with(&mut c, &[v4], DEFAULT_BASELINE).unwrap();
-        assert!(!table_exists(&c, "should_not_exist"), "探针命中时不得执行脚本");
+        run_with(&pool, &[v4], DEFAULT_BASELINE).await.unwrap();
+        assert!(
+            !table_exists(&pool, "should_not_exist").await,
+            "探针命中时不得执行脚本"
+        );
         assert_eq!(
-            history_versions(&c),
+            history_versions(&pool).await,
             vec![
                 ("BASELINE".to_string(), DEFAULT_BASELINE),
                 ("SQL".to_string(), 4),
@@ -387,26 +469,29 @@ mod tests {
             4,
             "already_done",
             "CREATE TABLE should_not_exist (x INTEGER);",
-            |_| true,
+            || true,
         );
-        run_with(&mut c, &[v4], DEFAULT_BASELINE).unwrap();
-        assert_eq!(history_versions(&c).len(), 2);
+        run_with(&pool, &[v4], DEFAULT_BASELINE).await.unwrap();
+        assert_eq!(history_versions(&pool).await.len(), 2);
 
         // 探针返回 false 时走正常执行路径
-        let mut c2 = Connection::open_in_memory().unwrap();
+        let pool2 = open_mem().await;
         let v4 = mg_probed(
             4,
             "needs_run",
             "CREATE TABLE really_created (x INTEGER);",
-            |_| false,
+            || false,
         );
-        run_with(&mut c2, &[v4], DEFAULT_BASELINE).unwrap();
-        assert!(table_exists(&c2, "really_created"), "探针未命中时必须执行脚本");
+        run_with(&pool2, &[v4], DEFAULT_BASELINE).await.unwrap();
+        assert!(
+            table_exists(&pool2, "really_created").await,
+            "探针未命中时必须执行脚本"
+        );
     }
 
-    #[test]
-    fn failing_migration_rolls_back_dml_and_ddl() {
-        let mut c = Connection::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn failing_migration_rolls_back_dml_and_ddl() {
+        let pool = open_mem().await;
         let bad = mg(
             4,
             "bad_sql",
@@ -415,60 +500,69 @@ mod tests {
              INSERT INTO rollback_probe VALUES (1); \
              INSERT INTO no_such_table VALUES (1);",
         );
-        let err = run_with(&mut c, &[bad], DEFAULT_BASELINE).unwrap_err();
-        assert!(err.contains("V4__bad_sql.sql"), "错误信息: {}", err);
-        assert!(!table_exists(&c, "rollback_probe"), "DDL 应随事务回滚");
+        let err = run_with(&pool, &[bad], DEFAULT_BASELINE)
+            .await
+            .unwrap_err();
+        assert!(err.contains("V4__bad_sql.sql"), "错误信息: {err}");
+        assert!(
+            !table_exists(&pool, "rollback_probe").await,
+            "DDL 应随事务回滚"
+        );
         assert_eq!(
-            history_versions(&c),
+            history_versions(&pool).await,
             vec![("BASELINE".to_string(), DEFAULT_BASELINE)]
         );
     }
 
-    #[test]
-    fn previous_migration_failure_does_not_block_later_success() {
-        let mut c = Connection::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn previous_migration_failure_does_not_block_later_success() {
+        let pool = open_mem().await;
         let bad = mg(4, "bad_sql", "INSERT INTO no_such_table VALUES (1);");
-        run_with(&mut c, &[bad], DEFAULT_BASELINE).unwrap_err();
+        run_with(&pool, &[bad], DEFAULT_BASELINE)
+            .await
+            .unwrap_err();
         // 修正后重启：同一版本可重新应用
         let fixed = mg(4, "bad_sql", "CREATE TABLE fixed_probe (id INTEGER);");
-        run_with(&mut c, &[fixed], DEFAULT_BASELINE).unwrap();
-        assert!(table_exists(&c, "fixed_probe"));
+        run_with(&pool, &[fixed], DEFAULT_BASELINE).await.unwrap();
+        assert!(table_exists(&pool, "fixed_probe").await);
     }
 
-    #[test]
-    fn checksum_mismatch_is_rejected() {
-        let mut c = Connection::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn checksum_mismatch_is_rejected() {
+        let pool = open_mem().await;
         let v4 = mg(4, "mutable", "CREATE TABLE t (x INTEGER);");
-        run_with(&mut c, &[v4], DEFAULT_BASELINE).unwrap();
+        run_with(&pool, &[v4], DEFAULT_BASELINE).await.unwrap();
         let tampered = mg(4, "mutable", "CREATE TABLE t (x TEXT);");
-        let err = run_with(&mut c, &[tampered], DEFAULT_BASELINE).unwrap_err();
-        assert!(err.contains("checksum"), "错误信息: {}", err);
+        let err = run_with(&pool, &[tampered], DEFAULT_BASELINE)
+            .await
+            .unwrap_err();
+        assert!(err.contains("checksum"), "错误信息: {err}");
     }
 
-    #[test]
-    fn applied_version_missing_from_registry_is_rejected() {
-        let mut c = Connection::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn applied_version_missing_from_registry_is_rejected() {
+        let pool = open_mem().await;
         let v4 = mg(4, "gone", "CREATE TABLE t (x INTEGER);");
-        run_with(&mut c, &[v4], DEFAULT_BASELINE).unwrap();
+        run_with(&pool, &[v4], DEFAULT_BASELINE).await.unwrap();
         // 新程序的注册表里没有 V4（降级场景）
-        let err = run_with(&mut c, &[], DEFAULT_BASELINE).unwrap_err();
-        assert!(err.contains("V4") && err.contains("降级"), "错误信息: {}", err);
+        let err = run_with(&pool, &[], DEFAULT_BASELINE).await.unwrap_err();
+        assert!(err.contains("V4") && err.contains("降级"), "错误信息: {err}");
     }
 
-    #[test]
-    fn invalid_registry_is_rejected() {
-        let mut c = Connection::open_in_memory().unwrap();
+    #[tokio::test]
+    async fn invalid_registry_is_rejected() {
+        let pool = open_mem().await;
         // 版本不能等于基线
         let at_baseline = mg(DEFAULT_BASELINE, "x", "SELECT 1;");
-        assert!(run_with(&mut c, &[at_baseline], DEFAULT_BASELINE).is_err());
+        assert!(run_with(&pool, &[at_baseline], DEFAULT_BASELINE).await.is_err());
 
         // 必须严格递增
         let v5 = mg(5, "five", "SELECT 1;");
         let v4 = mg(4, "four", "SELECT 1;");
-        assert!(run_with(&mut c, &[v5, v4], DEFAULT_BASELINE).is_err());
+        assert!(run_with(&pool, &[v5, v4], DEFAULT_BASELINE).await.is_err());
 
         // 名称只能是小写 snake_case
         let bad_name = mg(4, "Bad-Name", "SELECT 1;");
-        assert!(run_with(&mut c, &[bad_name], DEFAULT_BASELINE).is_err());
+        assert!(run_with(&pool, &[bad_name], DEFAULT_BASELINE).await.is_err());
     }
 }
