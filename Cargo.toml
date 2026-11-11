@@ -1,0 +1,23 @@
+[package]
+name = "vc-desktop-kit"
+version = "0.1.0"
+edition = "2021"
+description = "Tauri 2 桌面端通用基础框架 kit：splash 启动页、KV 配置、托盘/关窗、通知引擎、SQLite 迁移器"
+license = "MIT"
+# web/ 是配套的前端包（npm），不参与 crate 打包。
+exclude = ["web"]
+
+[dependencies]
+# 窗口/托盘/主题/启动页共用 Tauri 2；tray-icon + image-png 供托盘图标构建。
+tauri = { version = "2", features = ["tray-icon", "image-png"] }
+# 系统通知插件（notify 模块）。
+tauri-plugin-notification = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# 迁移器仅依赖 rusqlite（与宿主同源，不会重复链接 SQLite）。
+rusqlite = { version = "0.32", features = ["bundled"] }
+chrono = "0.4"
+once_cell = "1"
+# splash macOS alpha 握手（公开 API，与桌面端同版本）。
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"

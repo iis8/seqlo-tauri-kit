@@ -1,0 +1,30 @@
+{
+  "name": "@seqlo/tauri-notify",
+  "version": "0.1.0",
+  "description": "Tauri 2 桌面端应用内通知浮层：队列/摘要/兜底引擎 + Vue 组件（配合 vc-desktop-kit 的 notify 模块）",
+  "type": "module",
+  "license": "MIT",
+  "files": ["src", "README.md"],
+  "main": "./src/index.js",
+  "module": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js",
+    "./core": "./src/core.js",
+    "./vue": "./src/useNotify.js",
+    "./NotifyToasts.vue": "./src/NotifyToasts.vue"
+  },
+  "scripts": {
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "vue": "^3.4.0"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.1.3",
+    "@vue/test-utils": "^2.5.0",
+    "jsdom": "^30.0.1",
+    "vite": "^5.4.6",
+    "vitest": "^2.1.9",
+    "vue": "^3.5.0"
+  }
+}
